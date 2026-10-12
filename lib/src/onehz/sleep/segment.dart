@@ -130,8 +130,7 @@ class SleepSegmentation {
         'tst_sec': tstSec,
         'waso_sec': wasoSec,
         'in_bed_sec': inBedSec,
-        'efficiency_pct':
-            efficiencyPct == null ? null : round6(efficiencyPct!),
+        'efficiency_pct': efficiencyPct == null ? null : round6(efficiencyPct!),
         'nrem_sec': nremSec,
         'light_sec': lightSec,
         'deep_sec': deepSec,
@@ -178,7 +177,9 @@ SleepSegmentation segmentSleep(
   final wm = forcedWindow == null
       ? vanHeesSleepWindow(trimmedAccel)
       : const Metric<SleepWindow>.absent(
-          tier: Tier.estimate, inputs_used: ['forced_window']);
+          tier: Tier.estimate,
+          inputs_used: ['forced_window'],
+        );
   final fallbackWindow = wm.value;
 
   // Local-time-of-day math (daytime guard + midsleep alignment) must use the
@@ -208,22 +209,27 @@ SleepSegmentation segmentSleep(
   ];
   final hr = <HrTs>[
     for (var i = 0; i < n; i++)
-      if (trimmedHr[i] > 0) HrTs(trimmedAccel[i].tsMs ~/ 1000, trimmedHr[i])
+      if (trimmedHr[i] > 0) HrTs(trimmedAccel[i].tsMs ~/ 1000, trimmedHr[i]),
   ];
   final rr = <RrTs>[
     for (var i = 0; i < math.min(rrMs.length, rrTsMs.length); i++)
       if (rrMs[i].isFinite && rrMs[i] > 0)
-        RrTs((rrTsMs[i] / 1000.0).round(), rrMs[i])
+        RrTs((rrTsMs[i] / 1000.0).round(), rrMs[i]),
   ];
 
-  final _SleepGroup? chosen;
+  _SleepGroup? chosen;
   if (forcedWindow != null) {
     final onsetSec = forcedWindow.onsetSec;
     final offsetSec = forcedWindow.offsetSec;
     if (offsetSec <= onsetSec) return SleepSegmentation.absent;
     // Stage the user-asserted window directly — no detection, no gates.
-    final session =
-        AdvancedSleepStager.stageWindow(onsetSec, offsetSec, grav, hr, rr: rr);
+    final session = AdvancedSleepStager.stageWindow(
+      onsetSec,
+      offsetSec,
+      grav,
+      hr,
+      rr: rr,
+    );
     chosen = _SleepGroup(
       sessions: [session],
       start: onsetSec,
@@ -247,6 +253,23 @@ SleepSegmentation segmentSleep(
     );
   }
   if (chosen == null) return SleepSegmentation.absent;
+  if (forcedWindow == null) {
+    final refined = quietEveningOnset(
+      startSec: chosen.start,
+      endSec: chosen.end,
+      hr: hr,
+      stages: [for (final session in chosen.sessions) ...session.stages],
+    );
+    if (refined > chosen.start) {
+      chosen = _SleepGroup(
+        sessions: chosen.sessions,
+        start: refined,
+        end: chosen.end,
+        asleepMin: chosen.asleepMin,
+        inBedSec: chosen.end - refined,
+      );
+    }
+  }
 
   final tsSec = [for (final a in trimmedAccel) a.tsMs ~/ 1000];
   final onset = _lowerBoundInt(tsSec, chosen.start);
@@ -308,7 +331,11 @@ SleepSegmentation segmentSleep(
     }
   }
   final efficiency = inBed > 0 ? 100.0 * tst / inBed : 0.0;
-  final conf = clamp(((wm.confidence > 0 ? wm.confidence : 0.45) + 0.5) / 2.0, 0.0, 0.6);
+  final conf = clamp(
+    ((wm.confidence > 0 ? wm.confidence : 0.45) + 0.5) / 2.0,
+    0.0,
+    0.6,
+  );
 
   return SleepSegmentation(
     window: SleepWindow(
@@ -316,15 +343,15 @@ SleepSegmentation segmentSleep(
       offsetIdx: offset,
       onsetMs: chosen.start * 1000.0,
       offsetMs: chosen.end * 1000.0,
-      immobile:
-          fallbackWindow?.immobile ?? List<bool>.filled(trimmedAccel.length, false),
+      immobile: fallbackWindow?.immobile ??
+          List<bool>.filled(trimmedAccel.length, false),
       // Forward the undecidable-second mask too. Dropping it here silently
       // downgraded "we could not tell" into "not immobile", which is the
       // conservative direction but costs the caller `unresolvedTailSec` — the
       // one signal that says a night ran past the end of the record.
       immobileUnknown: fallbackWindow?.immobileUnknown ?? const [],
-      zAngleDeg:
-          fallbackWindow?.zAngleDeg ?? List<double>.filled(trimmedAccel.length, 0.0),
+      zAngleDeg: fallbackWindow?.zAngleDeg ??
+          List<double>.filled(trimmedAccel.length, 0.0),
       sptSec: inBed,
     ),
     stages: perSec,
@@ -340,6 +367,71 @@ SleepSegmentation segmentSleep(
     wakeSec: wake,
     confidence: conf,
   );
+}
+
+/// A REM-heavy quiet prelude is weak evidence of actual sleep onset. Tighten
+/// it only with a later, sustained observed HR fall. Never synthesize samples,
+/// extend a window, touch a human-asserted window, or apply this to short bouts.
+int quietEveningOnset({
+  required int startSec,
+  required int endSec,
+  required List<HrTs> hr,
+  required List<StageSegment> stages,
+}) {
+  const leadingSec = 45 * 60, stableSec = 12 * 60;
+  if (endSec - startSec < 4 * 3600) return startSec;
+  var rem = 0, deep = 0;
+  for (final stage in stages) {
+    final seconds = math.max(
+      0,
+      math.min(stage.end, startSec + leadingSec) -
+          math.max(stage.start, startSec),
+    );
+    if (stage.stage == 'rem') rem += seconds.toInt();
+    if (stage.stage == 'deep') deep += seconds.toInt();
+  }
+  if (rem < leadingSec * .20 || deep > leadingSec * .05) return startSec;
+  final leading = [
+    for (final sample in hr)
+      if (sample.ts >= startSec &&
+          sample.ts < startSec + leadingSec &&
+          sample.bpm.isFinite &&
+          sample.bpm > 0)
+        sample.bpm,
+  ]..sort();
+  if (leading.length < leadingSec * .9) return startSec;
+  final threshold = leading[leading.length ~/ 2] - 2;
+  // At most two hours of tightening, and only timestamp-contiguous windows.
+  for (var start = startSec + leadingSec;
+      start <= startSec + 2 * 3600;
+      start += 60) {
+    if (start + stableSec >= endSec) break;
+    final samples = hr
+        .where(
+          (s) =>
+              s.ts >= start &&
+              s.ts < start + stableSec &&
+              s.bpm.isFinite &&
+              s.bpm > 0,
+        )
+        .toList();
+    if (samples.length < stableSec * .9) continue;
+    var gap = false;
+    for (var i = 1; i < samples.length; i++) {
+      if (samples[i].ts - samples[i - 1].ts > 60) {
+        gap = true;
+        break;
+      }
+    }
+    if (gap ||
+        samples.first.ts - start > 30 ||
+        start + stableSec - samples.last.ts > 30) continue;
+    final values = samples.map((s) => s.bpm).toList()..sort();
+    if (values[values.length ~/ 2] <= threshold &&
+        values[(values.length * .9).floor()] <= threshold + 4)
+      return samples.firstWhere((sample) => sample.bpm <= threshold).ts;
+  }
+  return startSec;
 }
 
 class _SleepGroup {
@@ -450,8 +542,10 @@ _SleepGroup? _pickMainSleepGroup(
   double alignmentBonusFor(_SleepGroup g) {
     // Midsleep = the middle of the SPAN, never `start + inBedSec/2` — see
     // [_SleepGroup.inBedSec]/[_SleepGroup.midsleepSec].
-    final dist =
-        circularDistanceSec(localSecOfDay(g.midsleepSec), targetMidsleepSec);
+    final dist = circularDistanceSec(
+      localSecOfDay(g.midsleepSec),
+      targetMidsleepSec,
+    );
     if (dist <= fullWindowSec) return alignmentBonusMin;
     if (dist >= zeroWindowSec) return 0.0;
     final frac = (zeroWindowSec - dist) / (zeroWindowSec - fullWindowSec);
@@ -462,9 +556,7 @@ _SleepGroup? _pickMainSleepGroup(
   var bestScore = winner.asleepMin + alignmentBonusFor(winner);
   for (final g in groups.skip(1)) {
     final score = g.asleepMin + alignmentBonusFor(g);
-    if (score > bestScore ||
-        (score == bestScore &&
-            g.start < winner.start)) {
+    if (score > bestScore || (score == bestScore && g.start < winner.start)) {
       winner = g;
       bestScore = score;
     }
