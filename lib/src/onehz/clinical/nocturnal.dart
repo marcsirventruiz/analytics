@@ -35,9 +35,32 @@ class NocturnalRhr {
 /// yields an ABSENT metric — we never relabel the whole-night mean as a
 /// lowest-30-min trough.
 Metric<NocturnalRhr> nocturnalRhr(List<double> hr,
-    {int windowSamples = 1800, double minCoverage = 0.9}) {
+    {int windowSamples = 1800, double minCoverage = 0.9, List<int>? tsSec}) {
   const inputs = ['hr_1hz'];
-  final valid = hr.where((h) => h > 0).toList();
+  if (tsSec != null) {
+    if (tsSec.length != hr.length ||
+        tsSec.isEmpty ||
+        tsSec.last < tsSec.first ||
+        tsSec.last - tsSec.first > 48 * 3600) {
+      return const Metric<NocturnalRhr>.absent(
+          tier: Tier.high,
+          inputs_used: inputs,
+          note: 'invalid nocturnal HR timestamps');
+    }
+    final dense = List<double>.filled(tsSec.last - tsSec.first + 1, 0);
+    for (var i = 0; i < tsSec.length; i++) {
+      if (i > 0 && tsSec[i] <= tsSec[i - 1]) {
+        return const Metric<NocturnalRhr>.absent(
+            tier: Tier.high,
+            inputs_used: inputs,
+            note: 'unordered or duplicate HR seconds');
+      }
+      dense[tsSec[i] - tsSec.first] = hr[i];
+    }
+    hr = dense;
+  }
+  bool validHr(double h) => h.isFinite && h > 0;
+  final valid = hr.where(validHr).toList();
   if (windowSamples < 1 || hr.length < windowSamples) {
     return const Metric<NocturnalRhr>.absent(
       tier: Tier.high,
@@ -52,7 +75,7 @@ Metric<NocturnalRhr> nocturnalRhr(List<double> hr,
   var sum = 0.0;
   var count = 0;
   for (var i = 0; i < windowSamples; i++) {
-    if (hr[i] > 0) {
+    if (validHr(hr[i])) {
       sum += hr[i];
       count++;
     }
@@ -60,12 +83,12 @@ Metric<NocturnalRhr> nocturnalRhr(List<double> hr,
   double? best;
   if (count >= needValid) best = sum / count;
   for (var i = windowSamples; i < hr.length; i++) {
-    if (hr[i] > 0) {
+    if (validHr(hr[i])) {
       sum += hr[i];
       count++;
     }
     final out = hr[i - windowSamples];
-    if (out > 0) {
+    if (validHr(out)) {
       sum -= out;
       count--;
     }

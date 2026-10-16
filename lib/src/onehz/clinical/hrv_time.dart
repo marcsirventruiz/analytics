@@ -13,6 +13,7 @@
 import 'dart:math' as math;
 import '../types.dart';
 import '../util.dart';
+import '../foundations/rr_window.dart';
 
 class HrvTime {
   final double? rmssd; // ms
@@ -198,13 +199,18 @@ Metric<double> sleepSessionWindowedRmssd(
   required int startSec,
   required int endSec,
   int windowSec = 300,
+  List<int>? sleepTsSec,
+  List<String>? sleepStages,
 }) {
   const inputs = ['rr_sleep_window'];
   if (startSec <= 0 ||
       endSec <= startSec ||
       rrMs.isEmpty ||
       rrTsMs.isEmpty ||
-      rrMs.length != rrTsMs.length) {
+      rrMs.length != rrTsMs.length ||
+      windowSec <= 0 ||
+      ((sleepTsSec == null) != (sleepStages == null)) ||
+      (sleepTsSec != null && sleepTsSec.length != sleepStages!.length)) {
     return const Metric<double>.absent(
       tier: Tier.high,
       inputs_used: inputs,
@@ -212,47 +218,66 @@ Metric<double> sleepSessionWindowedRmssd(
     );
   }
 
-  final buckets = <int, List<double>>{};
-  for (var i = 0; i < rrMs.length; i++) {
-    final tsSec = (rrTsMs[i] / 1000.0).round();
-    if (tsSec < startSec || tsSec >= endSec) continue;
-    final idx = ((tsSec - startSec) ~/ windowSec);
-    (buckets[idx] ??= <double>[]).add(rrMs[i]);
+  for (var i = 0; i < rrTsMs.length; i++) {
+    if (!rrTsMs[i].isFinite || (i > 0 && rrTsMs[i] < rrTsMs[i - 1])) {
+      return const Metric<double>.absent(
+          tier: Tier.high, inputs_used: inputs, note: 'invalid RR timestamps');
+    }
   }
-
-  if (buckets.isEmpty) {
+  final asleep = sleepTsSec == null
+      ? null
+      : <int>{
+          for (var i = 0; i < sleepTsSec.length; i++)
+            if (const ['nrem', 'light', 'deep', 'rem']
+                .contains(sleepStages![i]))
+              sleepTsSec[i],
+        };
+  final observedRr = asleep == null
+      ? rrMs
+      : <double>[
+          for (var i = 0; i < rrMs.length; i++)
+            asleep.contains((rrTsMs[i] / 1000).floor()) ? rrMs[i] : double.nan,
+        ];
+  final windowCount = (endSec - startSec) ~/ windowSec;
+  if (windowCount == 0) {
     return const Metric<double>.absent(
       tier: Tier.high,
       inputs_used: inputs,
-      note: 'no RR beats inside the session window',
+      note: 'no complete five-minute RR window',
     );
   }
 
   final rmssds = <double>[];
-  final indices = buckets.keys.toList()..sort();
-  for (final idx in indices) {
-    final cleaned = _cleanWindowRr(buckets[idx]!);
-    if (cleaned.length < 2) continue;
-    final rmssd = _rmssdRaw(cleaned);
-    if (rmssd != null) rmssds.add(rmssd);
+  var coveredMs = 0.0;
+  for (var idx = 0; idx < windowCount; idx++) {
+    final start = (startSec + idx * windowSec) * 1000.0;
+    final stats = analyseRrWindow(observedRr, rrTsMs,
+        startMs: start, endMs: start + windowSec * 1000);
+    if (!stats.usable) continue;
+    rmssds.add(stats.rmssd!);
+    coveredMs += stats.coveredMs;
   }
-
-  if (rmssds.isEmpty) {
+  final coverage = coveredMs / ((endSec - startSec) * 1000);
+  if (rmssds.length < 3 || coverage < 0.5) {
     return const Metric<double>.absent(
       tier: Tier.high,
       inputs_used: inputs,
-      note: 'no valid 5-min windows for sleep-session RMSSD',
+      note: 'insufficient usable sleep RR: need at least 3 complete windows '
+          'and 50% session coverage; no fallback to sparse/whole-night RMSSD',
     );
   }
 
   final meanRmssd = mean(rmssds)!;
-  final conf = clamp(rmssds.length / 12.0, 0.3, 0.95);
+  final conf = clamp(0.4 + 0.4 * coverage, 0.4, 0.8);
   return Metric<double>(
     value: meanRmssd,
     confidence: conf,
     tier: Tier.high,
     inputs_used: inputs,
-    note: 'sleep-session HRV: mean RMSSD over cleaned 5-min windows.',
+    note: 'PRV, not ECG HRV: mean RMSSD of ${rmssds.length}/$windowCount '
+        'quality-gated 5-min sleep windows; coverage=${(coverage * 100).round()}%; '
+        'awake/rejected beats and timestamp gaps never bridged. '
+        'Not the proprietary WHOOP weighting.',
   );
 }
 
@@ -276,44 +301,4 @@ List<List<double>> _fiveMinSegments(List<double> nn, List<double> times) {
   }
   if (cur.length >= 2) out.add(cur);
   return out;
-}
-
-List<double> _cleanWindowRr(List<double> rr) =>
-    _rejectWindowEctopic([for (final v in rr) if (v >= 300 && v <= 2000) v]);
-
-List<double> _rejectWindowEctopic(List<double> nn) {
-  const radius = 2;
-  const threshold = 0.20;
-  if (nn.length <= radius) return nn;
-  final kept = <double>[];
-  for (var i = 0; i < nn.length; i++) {
-    final lo = math.max(0, i - radius);
-    final hi = math.min(nn.length - 1, i + radius);
-    final neighbors = <double>[];
-    for (var j = lo; j <= hi; j++) {
-      if (j != i) neighbors.add(nn[j]);
-    }
-    if (neighbors.length < 2) {
-      kept.add(nn[i]);
-      continue;
-    }
-    final med = median(neighbors);
-    if (med == null || med <= 0) {
-      kept.add(nn[i]);
-      continue;
-    }
-    final deviation = (nn[i] - med).abs() / med;
-    if (deviation <= threshold) kept.add(nn[i]);
-  }
-  return kept;
-}
-
-double? _rmssdRaw(List<double> nn) {
-  if (nn.length < 2) return null;
-  var sumSq = 0.0;
-  for (var i = 1; i < nn.length; i++) {
-    final d = nn[i] - nn[i - 1];
-    sumSq += d * d;
-  }
-  return math.sqrt(sumSq / (nn.length - 1));
 }
