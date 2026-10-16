@@ -76,6 +76,27 @@ void main() {
     expect(m.value, closeTo(200, 1e-8));
   });
 
+  test(
+      'night coverage counts qualified windows without double discounting their coverage',
+      () {
+    final times = <double>[], values = <double>[];
+    for (var w = 0; w < 6; w++) {
+      for (var i = 0; i < 225; i++) {
+        times.add((start + w * 300 + i) * 1000.0);
+        values.add(i.isEven ? 995 : 1005);
+      }
+    }
+    // Six out of ten full windows qualify at 75% RR coverage each. Requiring
+    // their SUMMED observed beat durations to cover half the entire night
+    // would apply the within-window coverage gate twice (0.60 * 0.75 < 0.50).
+    final m = sleepSessionWindowedRmssd(values, times,
+        startSec: start, endSec: start + 3000);
+    expect(m.present, isTrue);
+    expect(m.value, closeTo(10, 1e-8));
+    expect(m.confidence, lessThan(0.8),
+        reason: 'partial coverage remains disclosed');
+  });
+
   test('missing, reversed and mismatched timestamps abstain', () {
     for (final times in [
       <double>[],

@@ -191,8 +191,12 @@ Metric<double> nocturnalRmssd(
 ///
 /// [rrMs]/[rrTsMs] are the raw RR intervals and their beat-end epoch times in
 /// milliseconds. [startSec]/[endSec] bound the chosen sleep session in epoch
-/// seconds. The implementation is one-pass over the time-sorted RR stream:
-/// beats are bucketed once by `(tsSec - startSec) ~/ windowSec`.
+/// seconds. Windows use binary bounds on the ordered RR timestamps. Each
+/// window needs >=70% observed NN-pair coverage, <=20% rejected beats and
+/// >=30 pairs. At least three windows and half the complete session windows
+/// must qualify. These are disclosed engineering gates, not clinical validation.
+/// Optional timestamp-aligned stages exclude observed wake without joining its
+/// neighbours. Missing/rejected runs never become adjacent RR differences.
 Metric<double> sleepSessionWindowedRmssd(
   List<double> rrMs,
   List<double> rrTsMs, {
@@ -258,12 +262,16 @@ Metric<double> sleepSessionWindowedRmssd(
     coveredMs += stats.coveredMs;
   }
   final coverage = coveredMs / ((endSec - startSec) * 1000);
-  if (rmssds.length < 3 || coverage < 0.5) {
+  // A window already passed its own >=70% observed-pair coverage gate. Night
+  // representativeness is the fraction of those qualified WINDOWS, not the
+  // coverage multiplied by that same threshold a second time.
+  final qualifiedWindowFraction = rmssds.length / windowCount;
+  if (rmssds.length < 3 || qualifiedWindowFraction < 0.5) {
     return const Metric<double>.absent(
       tier: Tier.high,
       inputs_used: inputs,
       note: 'insufficient usable sleep RR: need at least 3 complete windows '
-          'and 50% session coverage; no fallback to sparse/whole-night RMSSD',
+          'and 50% qualified session windows; no fallback to sparse/whole-night RMSSD',
     );
   }
 
@@ -276,7 +284,8 @@ Metric<double> sleepSessionWindowedRmssd(
     inputs_used: inputs,
     note: 'PRV, not ECG HRV: mean RMSSD of ${rmssds.length}/$windowCount '
         'quality-gated 5-min sleep windows; coverage=${(coverage * 100).round()}%; '
-        'awake/rejected beats and timestamp gaps never bridged. '
+        '${asleep == null ? "Sleep stages unavailable; " : "detected wake excluded; "}'
+        'rejected beats and timestamp gaps never bridged. '
         'Not the proprietary WHOOP weighting.',
   );
 }
